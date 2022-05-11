@@ -30,6 +30,7 @@ import json
 import re
 from pathlib import Path
 
+import pandas as pd
 import librosa
 import numpy as np
 import torch
@@ -92,7 +93,7 @@ def estimate_pitch(wav, mel_len, method='pyin', normalize_mean=None,
         snd, sr = librosa.load(wav)
         pitch_mel, voiced_flag, voiced_probs = librosa.pyin(
             snd, fmin=librosa.note_to_hz('C2'),
-            fmax=librosa.note_to_hz('C7'), frame_length=1024)
+            fmax=librosa.note_to_hz('C7'), frame_length=1024, center=False)
         assert np.abs(mel_len - pitch_mel.shape[0]) <= 1.0
 
         pitch_mel = np.where(np.isnan(pitch_mel), 0.0, pitch_mel)
@@ -121,6 +122,9 @@ def normalize_pitch(pitch, mean, std):
     pitch[zeros] = 0.0
     return pitch
 
+def get_name(path: str) -> str:
+    return path.split('/')[-1][:-4]
+
 
 class TTSDataset(torch.utils.data.Dataset):
     """
@@ -133,13 +137,13 @@ class TTSDataset(torch.utils.data.Dataset):
                  audiopaths_and_text,
                  text_cleaners,
                  n_mel_channels,
-                 symbol_set='english_basic',
+                 symbol_set='russian_graphemes',
                  p_arpabet=1.0,
                  n_speakers=1,
                  load_mel_from_disk=True,
                  load_pitch_from_disk=True,
-                 pitch_mean=214.72203,  # LJSpeech defaults
-                 pitch_std=65.72038,
+                 pitch_mean=237.121,  # alyona defaults
+                 pitch_std=76.065605,
                  max_wav_value=None,
                  sampling_rate=None,
                  filter_length=None,
@@ -159,10 +163,18 @@ class TTSDataset(torch.utils.data.Dataset):
         if type(audiopaths_and_text) is str:
             audiopaths_and_text = [audiopaths_and_text]
 
-        self.dataset_path = dataset_path
-        self.audiopaths_and_text = load_filepaths_and_text(
-            dataset_path, audiopaths_and_text,
-            has_speakers=(n_speakers > 1))
+
+        print(f'symbol_set!!! {symbol_set}')
+        print(f'data_path: {audiopaths_and_text[0]}')
+        self.dataset_path = audiopaths_and_text[0]
+        self.dataset = pd.read_csv(self.dataset_path)
+        self.dataset = self.dataset[self.dataset['mel_seq_lens'] < 1500].reset_index()
+        print(f"load dataset with {len(self.dataset)} samples")
+        # self.audiopaths_and_text = load_filepaths_and_text(
+        #     dataset_path, audiopaths_and_text,
+        #     has_speakers=(n_speakers > 1))
+
+        
         self.load_mel_from_disk = load_mel_from_disk
         if not load_mel_from_disk:
             self.max_wav_value = max_wav_value
@@ -193,12 +205,12 @@ class TTSDataset(torch.utils.data.Dataset):
 
         assert not (load_pitch_from_disk and self.pitch_tmp_dir is not None)
 
-        if len(self.audiopaths_and_text[0]) < expected_columns:
-            raise ValueError(f'Expected {expected_columns} columns in audiopaths file. '
-                             'The format is <mel_or_wav>|[<pitch>|]<text>[|<speaker_id>]')
+        # if len(self.audiopaths_and_text[0]) < expected_columns:
+        #     raise ValueError(f'Expected {expected_columns} columns in audiopaths file. '
+        #                      'The format is <mel_or_wav>|[<pitch>|]<text>[|<speaker_id>]')
 
-        if len(self.audiopaths_and_text[0]) > expected_columns:
-            print('WARNING: Audiopaths file has more columns than expected')
+        # if len(self.audiopaths_and_text[0]) > expected_columns:
+        #     print('WARNING: Audiopaths file has more columns than expected')
 
         to_tensor = lambda x: torch.Tensor([x]) if type(x) is float else x
         self.pitch_mean = to_tensor(pitch_mean)
@@ -206,18 +218,31 @@ class TTSDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, index):
         # Separate filename and text
+        # if self.n_speakers > 1:
+        #     audiopath, *extra, text, speaker = self.audiopaths_and_text[index]
+        #     speaker = int(speaker)
+        # else:
+        #     audiopath, *extra, text = self.audiopaths_and_text[index]
+        #     speaker = None
+        
+        row = self.dataset.loc[index]
         if self.n_speakers > 1:
-            audiopath, *extra, text, speaker = self.audiopaths_and_text[index]
-            speaker = int(speaker)
+            speaker = int(row['emotion_id'])
         else:
-            audiopath, *extra, text = self.audiopaths_and_text[index]
             speaker = None
+        mel_path = 'alyona/mels/' + get_name(row['mel_path']) + '.npy'
+        text_path = 'alyona/texts/' + get_name(row['mel_path']) + '.txt'
+        audiopath = 'alyona/wavs/' + get_name(row['audio_path']) + '.wav'
+        pitch_path = 'alyona/my_pitch/' + get_name(row['audio_path']) + '.pt'
+        with open(text_path, 'r') as t:
+            text = t.read().strip()
+            # print(text)
 
-        mel = self.get_mel(audiopath)
+        mel = self.get_mel(mel_path)
         text = self.get_text(text)
-        pitch = self.get_pitch(index, mel.size(-1))
+        pitch = self.get_pitch(pitch_path, mel.size(-1))
         energy = torch.norm(mel.float(), dim=0, p=2)
-        attn_prior = self.get_prior(index, mel.shape[1], text.shape[0])
+        attn_prior = self.get_prior(audiopath, mel.shape[1], text.shape[0])
 
         assert pitch.size(-1) == mel.size(-1)
 
@@ -225,11 +250,12 @@ class TTSDataset(torch.utils.data.Dataset):
         if len(pitch.size()) == 1:
             pitch = pitch[None, :]
 
+
         return (text, mel, len(text), pitch, energy, speaker, attn_prior,
                 audiopath)
 
     def __len__(self):
-        return len(self.audiopaths_and_text)
+        return len(self.dataset)
 
     def get_mel(self, filename):
         if not self.load_mel_from_disk:
@@ -244,16 +270,26 @@ class TTSDataset(torch.utils.data.Dataset):
             melspec = self.stft.mel_spectrogram(audio_norm)
             melspec = torch.squeeze(melspec, 0)
         else:
-            melspec = torch.load(filename)
+            melspec = np.load(filename)
+            
+            melspec = torch.from_numpy(melspec)
+            if melspec.shape[0] != 80:
+                melspec = torch.transpose(melspec, 0, 1)
             # assert melspec.size(0) == self.stft.n_mel_channels, (
             #     'Mel dimension mismatch: given {}, expected {}'.format(
             #         melspec.size(0), self.stft.n_mel_channels))
 
         return melspec
 
-    def get_text(self, text):
+    def get_text(self, text: str):
+        text = [symbol for symbol in text.split(' ') if symbol != "<eos>"]
+        assert " " not in text
+
+        #to ids
         text = self.tp.encode_text(text)
-        space = [self.tp.encode_text("A A")[1]]
+
+        # TODO <space> not in tokens
+        space = [self.tp.encode_text(['а', '<space>', 'а'])[1]]
 
         if self.prepend_space_to_text:
             text = space + text
@@ -263,14 +299,13 @@ class TTSDataset(torch.utils.data.Dataset):
 
         return torch.LongTensor(text)
 
-    def get_prior(self, index, mel_len, text_len):
+    def get_prior(self, audiopath, mel_len, text_len):
 
         if self.use_betabinomial_interpolator:
             return torch.from_numpy(self.betabinomial_interpolator(mel_len,
                                                                    text_len))
 
         if self.betabinomial_tmp_dir is not None:
-            audiopath, *_ = self.audiopaths_and_text[index]
             fname = Path(audiopath).relative_to(self.dataset_path)
             fname = fname.with_suffix('.pt')
             cached_fpath = Path(self.betabinomial_tmp_dir, fname)
@@ -286,43 +321,41 @@ class TTSDataset(torch.utils.data.Dataset):
 
         return attn_prior
 
-    def get_pitch(self, index, mel_len=None):
-        audiopath, *fields = self.audiopaths_and_text[index]
+    def get_pitch(self, pitchpath, mel_len=None):
 
-        if self.n_speakers > 1:
-            spk = int(fields[-1])
-        else:
-            spk = 0
+        # if self.n_speakers > 1:
+        #     spk = int(fields[-1])
+        # else:
+        #     spk = 0
 
         if self.load_pitch_from_disk:
-            pitchpath = fields[0]
             pitch = torch.load(pitchpath)
             if self.pitch_mean is not None:
                 assert self.pitch_std is not None
                 pitch = normalize_pitch(pitch, self.pitch_mean, self.pitch_std)
             return pitch
 
-        if self.pitch_tmp_dir is not None:
-            fname = Path(audiopath).relative_to(self.dataset_path)
-            fname_method = fname.with_suffix('.pt')
-            cached_fpath = Path(self.pitch_tmp_dir, fname_method)
-            if cached_fpath.is_file():
-                return torch.load(cached_fpath)
+        # if self.pitch_tmp_dir is not None:
+        #     fname = Path(audiopath).relative_to(self.dataset_path)
+        #     fname_method = fname.with_suffix('.pt')
+        #     cached_fpath = Path(self.pitch_tmp_dir, fname_method)
+        #     if cached_fpath.is_file():
+        #         return torch.load(cached_fpath)
 
         # No luck so far - calculate
-        wav = audiopath
-        if not wav.endswith('.wav'):
-            wav = re.sub('/mels/', '/wavs/', wav)
-            wav = re.sub('.pt$', '.wav', wav)
+        # wav = audiopath
+        # if not wav.endswith('.wav'):
+        #     wav = re.sub('/mels/', '/wavs/', wav)
+        #     wav = re.sub('.pt$', '.wav', wav)
 
-        pitch_mel = estimate_pitch(wav, mel_len, self.f0_method,
-                                   self.pitch_mean, self.pitch_std)
+        # pitch_mel = estimate_pitch(wav, mel_len, self.f0_method,
+        #                             self.pitch_mean, self.pitch_std)
 
-        if self.pitch_tmp_dir is not None and not cached_fpath.is_file():
-            cached_fpath.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(pitch_mel, cached_fpath)
+        # if self.pitch_tmp_dir is not None and not cached_fpath.is_file():
+        #     cached_fpath.parent.mkdir(parents=True, exist_ok=True)
+        #     torch.save(pitch_mel, cached_fpath)
 
-        return pitch_mel
+        # return pitch_mel
 
 
 class TTSCollate:

@@ -13,13 +13,18 @@
 # limitations under the License.
 
 import argparse
+from collections import defaultdict
+from email.policy import default
 import itertools
 import sys
+import json
 import time
+from typing import DefaultDict
 import warnings
 from pathlib import Path
 from tqdm import tqdm
 
+import os
 import torch
 import numpy as np
 from scipy.stats import norm
@@ -109,7 +114,7 @@ def parse_args(parser):
     parser.add_argument('--speaker', type=int, default=0,
                         help='Speaker ID for a multi-speaker model')
 
-    parser.add_argument('--affinity', type=str, default='single',
+    parser.add_argument('--affinity', type=str, default='disabled',
                         choices=['socket', 'single', 'single_unique',
                                  'socket_unique_interleaved',
                                  'socket_unique_continuous',
@@ -137,7 +142,7 @@ def parse_args(parser):
     txt.add_argument('--text-cleaners', type=str, nargs='*',
                      default=['english_cleaners_v2'],
                      help='Type of text cleaners for input text')
-    txt.add_argument('--symbol-set', type=str, default='english_basic',
+    txt.add_argument('--symbol-set', type=str, default='russian_graphemes',
                      help='Define symbol set for input text')
     txt.add_argument('--p-arpabet', type=float, default=0.0, help='')
     txt.add_argument('--heteronyms-path', type=str,
@@ -163,7 +168,9 @@ def prepare_input_sequence(fields, device, symbol_set, text_cleaners,
                            load_pitch=False, p_arpabet=0.0):
     tp = TextProcessing(symbol_set, text_cleaners, p_arpabet=p_arpabet)
 
-    fields['text'] = [torch.LongTensor(tp.encode_text(text))
+
+    print(f'FIELD: {fields["text"]}')
+    fields['text'] = [torch.LongTensor(tp.encode_text(text.split(' ')))
                       for text in fields['text']]
     order = np.argsort([-t.size(0) for t in fields['text']])
 
@@ -177,7 +184,7 @@ def prepare_input_sequence(fields, device, symbol_set, text_cleaners,
         assert 'mel' in fields
         assert dataset is not None
         fields['mel'] = [
-            torch.load(Path(dataset, fields['mel'][i])).t() for i in order]
+            np.load(Path(dataset, fields['mel'][i])).T for i in order]
         fields['mel_lens'] = torch.LongTensor([t.size(0) for t in fields['mel']])
 
     if load_pitch:
@@ -305,12 +312,16 @@ def main():
     if args.l2_promote:
         l2_promote()
     torch.backends.cudnn.benchmark = args.cudnn_benchmark
+    # torch.backends.cudnn.benchmark=False
 
     if args.output is not None:
         Path(args.output).mkdir(parents=False, exist_ok=True)
+    
 
+    custom_logs_path = args.log_file
+    args.log_file = None
     log_fpath = args.log_file or str(Path(args.output, 'nvlog_infer.json'))
-    log_fpath = unique_log_fpath(log_fpath)
+    # log_fpath = unique_log_fpath(log_fpath)
     DLLogger.init(backends=[JSONStreamBackend(Verbosity.DEFAULT, log_fpath),
                             StdOutBackend(Verbosity.VERBOSE,
                                           metric_format=stdout_metric_format)
@@ -397,6 +408,8 @@ def main():
     if len(unk_args) > 0:
         raise ValueError(f'Invalid options {unk_args}')
 
+
+    print('Load Models')
     for k in CHECKPOINT_SPECIFIC_ARGS:
 
         v1 = gen_train_setup.get(k, None)
@@ -440,6 +453,7 @@ def main():
         with torch.no_grad():
             b = next(cycle)
             if generator is not None:
+                print(b['text'], b['text'].shape)
                 mel, *_ = generator(b['text'])
             else:
                 mel, mel_lens = b['mel'], b['mel_lens']
@@ -483,6 +497,7 @@ def main():
                 all_frames += mel.size(0) * mel.size(2)
                 log(rep, {f"{gen_name}_frames/s": gen_infer_perf})
                 log(rep, {f"{gen_name}_latency": gen_measures[-1]})
+                log(rep, {f"{gen_name}_mel_len": mel.shape})
 
                 if args.save_mels:
                     for i, mel_ in enumerate(mel):
@@ -493,6 +508,7 @@ def main():
 
             if vocoder is not None:
                 with torch.no_grad(), vocoder_measures:
+                    print(mel.shape)
                     audios = generate_audio(mel)
 
                 vocoder_infer_perf = (
@@ -503,7 +519,8 @@ def main():
 
                 if args.report_mel_loss:
                     voc_mel_loss_sum += mel_loss_fn(audios, mel, mel_lens)
-
+                
+                
                 if args.output is not None and reps == 1:
                     for i, audio in enumerate(audios):
                         audio = audio[:mel_lens[i].item() * args.hop_length]
@@ -540,6 +557,25 @@ def main():
         log((), {f"99%_{gen_name}_latency": gm.mean() + norm.ppf((1.0 + 0.99) / 2) * gm.std()})
         if args.report_mel_loss:
             log((), {f"avg_{gen_name}_mel-loss": gen_mel_loss_sum / all_utterances})
+        if custom_logs_path is not None:
+            if os.path.exists(custom_logs_path):
+                with open(custom_logs_path, 'r') as file:
+                    custom_logs = json.load(file)
+                    custom_logs = DefaultDict(list, custom_logs)
+            else:
+                custom_logs = DefaultDict(list)
+
+            custom_logs[f"avg_{gen_name}_tokens/s_bs_{args.batch_size}_amp_{args.amp}"].append(all_letters / gm.sum())
+            custom_logs[f"avg_{gen_name}_frames/s_bs_{args.batch_size}_amp_{args.amp}"].append(all_frames / gm.sum())
+            custom_logs[f"avg_{gen_name}_RTF@{args.batch_size}_amp_{args.amp}"].append(rtf_at)
+            custom_logs[f"avg_{gen_name}_latency_bs_{args.batch_size}_amp_{args.amp}"].append(gm.mean())
+            custom_logs[f"90%_{gen_name}_latency_bs_{args.batch_size}_amp_{args.amp}"].append(gm.mean() + norm.ppf((1.0 + 0.90) / 2) * gm.std())
+            custom_logs[f"99%_{gen_name}_latency_bs_{args.batch_size}_amp_{args.amp}"].append(gm.mean() + norm.ppf((1.0 + 0.99) / 2) * gm.std())
+
+            with open(custom_logs_path, 'w') as file:
+                json.dump(custom_logs, file)
+
+
     if vocoder is not None:
         vm = np.sort(np.asarray(vocoder_measures))
         rtf = all_samples / (all_utterances * vm.mean() * args.sampling_rate)

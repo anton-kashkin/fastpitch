@@ -119,7 +119,7 @@ def parse_args(parser):
     data.add_argument('--text-cleaners', nargs='*',
                       default=['english_cleaners'], type=str,
                       help='Type of text cleaners for input text')
-    data.add_argument('--symbol-set', type=str, default='english_basic',
+    data.add_argument('--symbol-set', type=str, default='russian_graphemes',
                       help='Define symbol set for input text')
     data.add_argument('--p-arpabet', type=float, default=0.0,
                       help='Probability of using arpabets instead of graphemes '
@@ -351,6 +351,8 @@ def main():
     parser = parse_args(parser)
     args, _ = parser.parse_known_args()
 
+    # print(f'synmbols _ used: {args.symbol_set}')
+
     if args.p_arpabet > 0.0:
         cmudict.initialize(args.cmudict_path, args.heteronyms_path)
 
@@ -464,6 +466,7 @@ def main():
     bmark_stats = BenchmarkStats()
 
     torch.cuda.synchronize()
+    print('torch_scale: ', scaler.get_scale(), args.world_size)
     for epoch in range(start_epoch, args.epochs + 1):
         epoch_start_time = time.perf_counter()
 
@@ -537,6 +540,25 @@ def main():
                 reduced_loss = loss.item()
                 reduced_num_frames = num_frames.item()
             if np.isnan(reduced_loss):
+                if args.local_rank == 0:
+                    out_file = 'file.pt'
+                elif args.local_rank == 1:
+                    out_file = 'file1.pt'
+                elif args.local_rank == 2:
+                    out_file = 'file2.pt'
+                if args.local_rank == 3:
+                    out_file = 'file3.pt'
+                
+                dicta = {'loss': loss,
+                        'y_pred': y_pred,
+                        'y': y,
+                        'x': x,
+                        'paths': x[-1],
+                        'bin_loss': binarization_loss,
+                        'meta': meta,
+                        'state_dict': model.state_dict()
+                        }
+                torch.save(dicta, out_file)
                 raise Exception("loss is NaN")
 
             accumulated_steps += 1
@@ -569,6 +591,10 @@ def main():
                 epoch_num_frames += iter_num_frames
                 epoch_mel_loss += iter_mel_loss
 
+                # scale = scaler.get_scale()
+
+                with torch.no_grad():
+                    bias_norm = torch.norm(model.module.decoder.layers[5].dec_attn.qkv_net.bias).item()
                 log((epoch, epoch_iter, num_iters), tb_total_steps=total_iter,
                     subset='train', data=OrderedDict([
                         ('loss', iter_loss),
@@ -577,7 +603,9 @@ def main():
                         ('kl_weight', kl_weight),
                         ('frames/s', iter_num_frames / iter_time),
                         ('took', iter_time),
-                        ('lrate', optimizer.param_groups[0]['lr'])]),
+                        ('lrate', optimizer.param_groups[0]['lr']),
+                        ('grad_scale', scaler.scale(loss).cpu().item()),
+                        ('bias_norm', bias_norm), ]),
                 )
 
                 accumulated_steps = 0

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from asyncio import FastChildWatcher
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -107,24 +108,33 @@ class MultiHeadAttn(nn.Module):
 
         n_head, d_head = self.n_head, self.d_head
 
-        head_q, head_k, head_v = torch.chunk(self.qkv_net(inp), 3, dim=2)
-        head_q = head_q.view(inp.size(0), inp.size(1), n_head, d_head)
-        head_k = head_k.view(inp.size(0), inp.size(1), n_head, d_head)
-        head_v = head_v.view(inp.size(0), inp.size(1), n_head, d_head)
+        with torch.cuda.amp.autocast(False):
 
-        q = head_q.permute(0, 2, 1, 3).reshape(-1, inp.size(1), d_head)
-        k = head_k.permute(0, 2, 1, 3).reshape(-1, inp.size(1), d_head)
-        v = head_v.permute(0, 2, 1, 3).reshape(-1, inp.size(1), d_head)
+            head_q, head_k, head_v = torch.chunk(self.qkv_net(inp.float()), 3, dim=2)
+            head_q = head_q.view(inp.size(0), inp.size(1), n_head, d_head)
+            head_k = head_k.view(inp.size(0), inp.size(1), n_head, d_head)
+            head_v = head_v.view(inp.size(0), inp.size(1), n_head, d_head)
 
-        attn_score = torch.bmm(q, k.transpose(1, 2))
-        attn_score.mul_(self.scale)
+            q = head_q.permute(0, 2, 1, 3).reshape(-1, inp.size(1), d_head)
+            k = head_k.permute(0, 2, 1, 3).reshape(-1, inp.size(1), d_head)
+            v = head_v.permute(0, 2, 1, 3).reshape(-1, inp.size(1), d_head)
+
+            attn_score = torch.bmm(q, k.transpose(1, 2))
+            attn_score.mul_(self.scale)
+
 
         if attn_mask is not None:
             attn_mask = attn_mask.unsqueeze(1).to(attn_score.dtype)
             attn_mask = attn_mask.repeat(n_head, attn_mask.size(2), 1)
             attn_score.masked_fill_(attn_mask.to(torch.bool), -float('inf'))
 
+        # print(f'softmaxes:', torch.isnan(attn_score).sum())
+        # print(k[0])
+        
         attn_prob = F.softmax(attn_score, dim=2)
+        # print(f'softmaxes:', torch.isnan(attn_prob).sum())
+        if torch.isnan(attn_prob).sum() > 0:
+            torch.save([attn_score, q, k, inp], 'att_scores.pt')
         attn_prob = self.dropatt(attn_prob)
         attn_vec = torch.bmm(attn_prob, v)
 
@@ -149,16 +159,23 @@ class MultiHeadAttn(nn.Module):
 
 
 class TransformerLayer(nn.Module):
-    def __init__(self, n_head, d_model, d_head, d_inner, kernel_size, dropout,
+    def __init__(self, n_head, d_model, d_head, d_inner, kernel_size, dropout, amp=None,
                  **kwargs):
         super(TransformerLayer, self).__init__()
+
+        self.amp = None
 
         self.dec_attn = MultiHeadAttn(n_head, d_model, d_head, dropout, **kwargs)
         self.pos_ff = PositionwiseConvFF(d_model, d_inner, kernel_size, dropout,
                                          pre_lnorm=kwargs.get('pre_lnorm'))
 
     def forward(self, dec_inp, mask=None):
-        output = self.dec_attn(dec_inp, attn_mask=~mask.squeeze(2))
+        if self.amp is not None:
+            with torch.cuda.amp.autocast(self.amp):
+                output = self.dec_attn(dec_inp.float(), attn_mask=~mask.squeeze(2))
+        else:
+            output = self.dec_attn(dec_inp, attn_mask=~mask.squeeze(2))
+        # print(f'after_attention_layer:', torch.isnan(output).sum())
         output *= mask
         output = self.pos_ff(output)
         output *= mask
@@ -185,10 +202,15 @@ class FFTransformer(nn.Module):
         self.drop = nn.Dropout(dropemb)
         self.layers = nn.ModuleList()
 
-        for _ in range(n_layer):
+        for i in range(n_layer):
+            if i == n_layer - 1:
+                amp = False
+            else:
+                amp = None
+            amp=None
             self.layers.append(
                 TransformerLayer(
-                    n_head, d_model, d_head, d_inner, kernel_size, dropout,
+                    n_head, d_model, d_head, d_inner, kernel_size, dropout, amp=amp,
                     dropatt=dropatt, pre_lnorm=pre_lnorm)
             )
 
@@ -206,7 +228,8 @@ class FFTransformer(nn.Module):
 
         out = self.drop(inp + pos_emb + conditioning)
 
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
+            # print(f'out_layer_{i}:', torch.isnan(out).sum())
             out = layer(out, mask=mask)
 
         # out = self.drop(out)

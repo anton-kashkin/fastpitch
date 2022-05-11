@@ -129,6 +129,8 @@ class FastPitch(nn.Module):
                  n_speakers, speaker_emb_weight, pitch_conditioning_formants=1):
         super(FastPitch, self).__init__()
 
+
+        print('speaker_emb_weight', speaker_emb_weight)
         self.encoder = FFTransformer(
             n_layer=in_fft_n_layers, n_head=in_fft_n_heads,
             d_model=symbols_embedding_dim,
@@ -307,11 +309,16 @@ class FastPitch(nn.Module):
             energy_pred = None
             energy_tgt = None
 
+        # print('enc:', torch.isnan(enc_out).sum())
+
         len_regulated, dec_lens = regulate_len(
             dur_tgt, enc_out, pace, mel_max_len)
 
+        # print('upsamples:', torch.isnan(len_regulated).sum())
+
         # Output FFT
         dec_out, dec_mask = self.decoder(len_regulated, dec_lens)
+        # print('dec_out:', torch.isnan(dec_out).sum())
         mel_out = self.proj(dec_out)
         return (mel_out, dec_mask, dur_pred, log_dur_pred, pitch_pred,
                 pitch_tgt, energy_pred, energy_tgt, attn_soft, attn_hard,

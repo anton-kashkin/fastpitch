@@ -2,21 +2,21 @@
 
 export OMP_NUM_THREADS=1
 
-: ${NUM_GPUS:=8}
+: ${NUM_GPUS:=4}
 : ${BATCH_SIZE:=16}
-: ${GRAD_ACCUMULATION:=2}
-: ${OUTPUT_DIR:="./output"}
+: ${GRAD_ACCUMULATION:=4}
+: ${OUTPUT_DIR:="./output/alyona"}
 : ${LOG_FILE:=$OUTPUT_DIR/nvlog.json}
-: ${DATASET_PATH:=LJSpeech-1.1}
-: ${TRAIN_FILELIST:=filelists/ljs_audio_pitch_text_train_v3.txt}
-: ${VAL_FILELIST:=filelists/ljs_audio_pitch_text_val.txt}
-: ${AMP:=false}
-: ${SEED:=""}
+: ${DATASET_PATH:=alyona}
+: ${TRAIN_FILELIST:=alyona/taco-train.csv}
+: ${VAL_FILELIST:=alyona/taco-valid.csv}
+: ${AMP:=true}
+: ${SEED:="1234"}
 
 : ${LEARNING_RATE:=0.1}
 
 # Adjust these when the amount of data changes
-: ${EPOCHS:=1000}
+: ${EPOCHS:=1500}
 : ${EPOCHS_PER_CHECKPOINT:=100}
 : ${WARMUP_STEPS:=1000}
 : ${KL_LOSS_WARMUP:=100}
@@ -30,7 +30,7 @@ export OMP_NUM_THREADS=1
 : ${APPEND_SPACES:=false}
 
 : ${LOAD_PITCH_FROM_DISK:=true}
-: ${LOAD_MEL_FROM_DISK:=false}
+: ${LOAD_MEL_FROM_DISK:=true}
 
 # For multispeaker models, add speaker ID = {0, 1, ...} as the last filelist column
 : ${NSPEAKERS:=1}

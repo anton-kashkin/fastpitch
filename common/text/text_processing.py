@@ -24,8 +24,9 @@ _arpa_re = re.compile(r'{[^}]+}|\S+')
 class TextProcessing(object):
     def __init__(self, symbol_set, cleaner_names, p_arpabet=0.0,
                  handle_arpabet='word', handle_arpabet_ambiguous='ignore',
-                 expand_currency=True):
+                 expand_currency=False):
         self.symbols = get_symbols(symbol_set)
+        print(f'symbols: {self.symbols}')
         self.cleaner_names = cleaner_names
 
         # Mappings from symbol to numeric ID and vice versa:
@@ -41,19 +42,9 @@ class TextProcessing(object):
 
     def text_to_sequence(self, text):
         sequence = []
-
-        # Check for curly braces and treat their contents as ARPAbet:
-        while len(text):
-            m = _curly_re.match(text)
-            if not m:
-                sequence += self.symbols_to_sequence(text)
-                break
-            sequence += self.symbols_to_sequence(m.group(1))
-            sequence += self.arpabet_to_sequence(m.group(2))
-            text = m.group(3)
-
+        sequence += self.symbols_to_sequence(text)
         return sequence
-
+        
     def sequence_to_text(self, sequence):
         result = ''
         for symbol_id in sequence:
@@ -122,43 +113,11 @@ class TextProcessing(object):
 
         return arpabet
 
-    def encode_text(self, text, return_all=False):
-        if self.expand_currency:
-            text = re.sub(_currency_re, _expand_currency, text)
-        text_clean = [self.clean_text(split) if split[0] != '{' else split
-                      for split in _arpa_re.findall(text)]
-        text_clean = ' '.join(text_clean)
-        text_clean = cleaners.collapse_whitespace(text_clean)
-        text = text_clean
-
-        text_arpabet = ''
-        if self.p_arpabet > 0:
-            if self.handle_arpabet == 'sentence':
-                if np.random.uniform() < self.p_arpabet:
-                    words = _words_re.findall(text)
-                    text_arpabet = [
-                        self.get_arpabet(word[0])
-                        if (word[0] != '') else word[1]
-                        for word in words]
-                    text_arpabet = ''.join(text_arpabet)
-                    text = text_arpabet
-            elif self.handle_arpabet == 'word':
-                words = _words_re.findall(text)
-                text_arpabet = [
-                    word[1] if word[0] == '' else (
-                        self.get_arpabet(word[0])
-                        if np.random.uniform() < self.p_arpabet
-                        else word[0])
-                    for word in words]
-                text_arpabet = ''.join(text_arpabet)
-                text = text_arpabet
-            elif self.handle_arpabet != '':
-                raise Exception("{} handle_arpabet is not supported".format(
-                    self.handle_arpabet))
+    def encode_text(self, text: list):
 
         text_encoded = self.text_to_sequence(text)
 
-        if return_all:
-            return text_encoded, text_clean, text_arpabet
+        # if return_all:
+        #     return text_encoded, text_clean, text_arpabet
 
         return text_encoded
